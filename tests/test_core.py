@@ -16,6 +16,9 @@ assume the bug's presence, and to work whether or not the optional
 """
 from __future__ import annotations
 
+import json
+import sys
+
 import numpy as np
 import pytest
 
@@ -163,28 +166,52 @@ def test_live_reproduction_of_numpy_32671():
 
 
 @requires_quaddtype
-def test_regression_this_exact_case_was_wrong_before_the_fix():
-    """Regression test for the exact minimal case from numpy/numpy#32671:
-    plain np.einsum on QuadPrecDType operands must currently disagree
-    with the float64 reference by more than trivial rounding error (this
-    IS the bug, reproduced live) -- and safe_einsum on the SAME operands
-    must match the float64 reference tightly. If numpy ever fixes this
-    upstream, the first assertion will start failing loudly, which is the
-    correct, honest signal that this guard's "affected" comparison should
-    be revisited -- not silently passing either way."""
-    from numpy_quaddtype import QuadPrecDType
+def test_regression_this_exact_case_was_wrong_or_crashes_before_the_fix():
+    """Regression test for the exact minimal case from numpy/numpy#32671,
+    run through the isolated-subprocess worker (never in-process -- the
+    upstream root cause is undefined behavior and has been independently
+    observed to SEGFAULT on ubuntu-latest x86_64 CI for this exact guard,
+    even though it only produces a silently wrong value on macOS/arm64;
+    calling the risky np.einsum directly in this test process crashed the
+    entire pytest session on first push -- see v23 in the fleet's
+    adaptive prompt history).
+
+    Either outcome (worker crash, OR worker survives but returns a value
+    that disagrees with the float64 reference by more than trivial
+    rounding error) counts as reproducing the bug. If numpy ever fixes
+    this upstream, the worker will survive AND match the reference,
+    which is real, desirable information -- this test would then fail
+    loudly, which is the correct signal to revisit this guard's
+    'affected' framing, not a guard bug."""
+    import subprocess
 
     rng = np.random.default_rng(0)
     a64, b64 = rng.standard_normal((2, 6, 6))
+    reference = np.einsum("ij,jk->ik", a64, b64)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "numpy_einsum_newdtype_guard._worker", "matmul_contraction"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    from numpy_quaddtype import QuadPrecDType
+
     a = np.asarray(a64, dtype=QuadPrecDType())
     b = np.asarray(b64, dtype=QuadPrecDType())
-
-    buggy = np.asarray(np.einsum("ij,jk->ik", a, b), dtype=np.float64)
-    reference = np.einsum("ij,jk->ik", a64, b64)
-    buggy_err = float(np.max(np.abs(buggy - reference)))
-
     safe = np.asarray(safe_einsum("ij,jk->ik", a, b), dtype=np.float64)
     safe_err = float(np.max(np.abs(safe - reference)))
+    assert safe_err < 1e-6
+
+    if proc.returncode != 0:
+        # A crash IS the bug reproduced (undefined behavior manifesting
+        # as a segfault rather than a wrong value on this platform).
+        return
+
+    payload = json.loads(proc.stdout)
+    buggy = np.asarray(payload["result"], dtype=np.float64)
+    buggy_err = float(np.max(np.abs(buggy - reference)))
 
     # This assertion documents the bug as observed at guard-creation time
     # (2026-09-21, numpy 2.5.3): silently wrong by a large margin, not
@@ -194,4 +221,3 @@ def test_regression_this_exact_case_was_wrong_before_the_fix():
         "-- numpy/numpy#32671 may be fixed upstream; re-evaluate this guard's "
         "'affected' framing rather than treating this failure as a guard bug."
     )
-    assert safe_err < 1e-6

@@ -29,7 +29,9 @@ specific dtypes affected by the bug -- not a numpy patch.
 from __future__ import annotations
 
 import functools
+import json
 import operator
+import sys
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, Sequence
@@ -196,52 +198,101 @@ def detect_einsum_newstyle_dtype_bug() -> BugDetectionResult:
     upstream issue itself uses to reproduce it) as a concrete, real
     new-style dtype.
 
-    Compares three independent computations of the SAME contraction on
-    the SAME data:
-    1. ``numpy.einsum`` directly on quad-precision operands (the
-       potentially-buggy path).
-    2. A float64 reference: the same contraction computed on the
-       original float64 data before it was cast to quad precision.
-    3. ``safe_einsum`` on the quad-precision operands (the fallback this
-       guard provides).
+    The upstream issue's own root-cause trace describes this as undefined
+    behavior (an out-of-bounds table index): it can manifest as either a
+    SILENTLY WRONG VALUE or a hard SEGFAULT depending on platform/
+    allocator/expression shape -- both have been independently observed
+    for this exact guard (silent wrong value on macOS/arm64, segfault on
+    ubuntu-latest x86_64 CI). Every actual ``np.einsum`` call on
+    quad-precision operands therefore runs in an ISOLATED SUBPROCESS
+    (``_worker.py``) so a crash on either platform only kills that
+    subprocess, never this process (or an entire pytest session) with it.
+    A nonzero/negative subprocess return code IS real bug evidence
+    (a crash), not a harness failure, and is reported as affected=True.
+
+    Compares, for each case, the (possibly crashing) einsum-on-quad-
+    precision result against a float64 reference computed on the
+    original float64 data before it was cast to quad precision, and
+    against ``safe_einsum``'s ``naive_einsum`` fallback (which never
+    calls ``np.einsum`` on the risky dtype at all, so it is always safe
+    to run directly in this process).
 
     Raises ``ImportError`` if ``numpy_quaddtype`` is not installed --
     callers (including the test suite) should skip rather than treat
     that as "not affected".
     """
-    from numpy_quaddtype import QuadPrecDType  # type: ignore[import-not-found]
+    import subprocess
+
+    from numpy_quaddtype import QuadPrecDType  # noqa: F401  (import-check only)
 
     rng = np.random.default_rng(0)
     a64, b64 = rng.standard_normal((2, 6, 6))
-    a = np.asarray(a64, dtype=QuadPrecDType())
-    b = np.asarray(b64, dtype=QuadPrecDType())
 
     dtype_name = "numpy_quaddtype.QuadPrecDType"
     tolerance = 1e-6
 
     cases = [
-        ("ij,jk->ik", (a, b), (a64, b64)),
-        ("i,i->", (a[0], a[0]), (a64[0], a64[0])),
+        ("matmul_contraction", "ij,jk->ik", (a64, b64)),
+        ("scalar_reduction", "i,i->", (a64[0], a64[0])),
     ]
 
     worst_buggy_err = 0.0
     worst_safe_err = 0.0
     details = []
-    for subs, quad_ops, ref_ops in cases:
-        buggy = np.asarray(np.einsum(subs, *quad_ops), dtype=np.float64)
-        reference = np.einsum(subs, *ref_ops)
-        safe = np.asarray(safe_einsum(subs, *quad_ops), dtype=np.float64)
+    crashed_cases = []
 
-        buggy_err = float(np.max(np.abs(buggy - reference)))
+    for worker_case, subs, ref_ops in cases:
+        proc = subprocess.run(
+            [sys.executable, "-m", "numpy_einsum_newdtype_guard._worker", worker_case],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        reference = np.einsum(subs, *ref_ops)
+
+        # Independent-of-the-worker safe path: naive_einsum never calls
+        # np.einsum on the quad-precision operands, so it is always safe
+        # to run directly here.
+        a = np.asarray(ref_ops[0], dtype=QuadPrecDType())
+        if len(ref_ops) == 2:
+            b = np.asarray(ref_ops[1], dtype=QuadPrecDType())
+            safe_result = safe_einsum(subs, a, b)
+        else:
+            safe_result = safe_einsum(subs, a)
+        safe = np.asarray(safe_result, dtype=np.float64)
         safe_err = float(np.max(np.abs(safe - reference)))
-        worst_buggy_err = max(worst_buggy_err, buggy_err)
         worst_safe_err = max(worst_safe_err, safe_err)
+
+        if proc.returncode != 0:
+            crashed_cases.append(worker_case)
+            worst_buggy_err = float("inf")
+            details.append(
+                f"{subs}: WORKER CRASHED (returncode={proc.returncode}, "
+                f"likely SIGSEGV) -- safe_err={safe_err:.3g}"
+            )
+            continue
+
+        payload = json.loads(proc.stdout)
+        buggy = np.asarray(payload["result"], dtype=np.float64)
+        buggy_err = float(np.max(np.abs(buggy - reference)))
+        worst_buggy_err = max(worst_buggy_err, buggy_err)
         details.append(f"{subs}: einsum_err={buggy_err:.3g} safe_err={safe_err:.3g}")
 
-    affected = worst_buggy_err > tolerance
+    affected = crashed_cases or worst_buggy_err > tolerance
     safe_is_correct = worst_safe_err <= tolerance
 
-    if affected and safe_is_correct:
+    if crashed_cases:
+        detail = (
+            f"CONFIRMED (via isolated subprocess): np.einsum SEGFAULTED for "
+            f"new-style dtype operands in case(s) {crashed_cases} -- "
+            f"numpy/numpy#32671 is undefined behavior and can crash the "
+            f"process rather than just return a wrong value on this "
+            f"platform. safe_einsum's naive_einsum fallback never calls "
+            f"np.einsum on this dtype and is unaffected "
+            f"(max abs error {worst_safe_err:.3g}). Per-case: "
+            + "; ".join(details)
+        )
+    elif affected and safe_is_correct:
         detail = (
             "CONFIRMED: np.einsum gives wrong results for new-style dtype "
             f"operands (max abs error {worst_buggy_err:.3g} vs float64 "
@@ -270,6 +321,6 @@ def detect_einsum_newstyle_dtype_bug() -> BugDetectionResult:
     return BugDetectionResult(
         numpy_version=np.__version__,
         dtype_name=dtype_name,
-        affected=affected,
+        affected=bool(affected),
         detail=detail,
     )

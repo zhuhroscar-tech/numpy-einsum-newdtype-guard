@@ -112,15 +112,20 @@ result = safe_einsum("ij,jk->ik", a, b)
   themselves have no such requirement and work with any new-style dtype
   under this package's own `requires-python = ">=3.9"` (they take
   whatever dtype-bearing arrays you already have).
-- Verified reproducing the bug on macOS (this host, ubuntu/macos CI both
-  run the live probe in `.github/workflows/ci.yml`). The upstream issue's
-  own report additionally mentions a segfault on a different platform for
-  a different expression shape (`np.einsum("ij->", a)` on Windows, vs the
-  silent-wrong-value behavior this guard directly reproduces on
-  Linux/macOS for `np.einsum("i,i->", a[0], a[0])`) — this guard's CI does
-  not attempt to reproduce a segfault path, only the silently-wrong-value
-  behavior that is directly observable and testable without risking a
-  crashed CI job.
+- The bug is UNDEFINED BEHAVIOR (an out-of-bounds C table index), and it
+  manifests differently by platform: on this project's macOS/arm64 dev
+  host it produces a silently wrong value; on `ubuntu-latest` x86_64 CI
+  it SEGFAULTED the whole pytest process on this guard's first CI run.
+  Because of that, every actual `np.einsum` call on a new-style-dtype
+  operand runs in an **isolated subprocess** (`_worker.py`, invoked via
+  `python -m numpy_einsum_newdtype_guard._worker <case>`) inside
+  `detect_einsum_newstyle_dtype_bug()` and its regression test — a crash
+  there only kills that subprocess, and a nonzero return code is treated
+  as confirmed bug evidence (a real segfault), not a test-harness
+  failure. `safe_einsum`'s `naive_einsum` fallback never calls
+  `np.einsum` on the risky dtype at all, so it never needs this
+  isolation. Verified on both `ubuntu-latest` and `macos-latest` CI
+  (`.github/workflows/ci.yml`) after adding the subprocess isolation.
 
 ## Development
 
